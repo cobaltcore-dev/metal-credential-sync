@@ -1,0 +1,135 @@
+# nameOverride: ""
+
+# fullnameOverride: ""
+
+owner-info:
+  support-group: "metal-support"
+  helm-chart-url: "https://artifacthub.io"
+  # maintainers: []
+  # service: ""
+
+manager:
+  enabled: true
+  replicas: 1
+  image:
+    repository: ghcr.io/ironcore-dev/metal-credential-sync
+    # tag: ""
+    pullPolicy: IfNotPresent
+
+  args:
+    - --leader-elect
+
+  env:
+    - name: SECRET_BACKEND_TYPE
+      value: vault
+    - name: VAULT_ADDR
+      value: https://vault.example.com:8200
+    - name: VAULT_AUTH_METHOD
+      value: kubernetes
+    - name: VAULT_ROLE
+      value: metal-credential-sync
+    - name: VAULT_MOUNT_PATH
+      value: secret
+    - name: PATH_TEMPLATE
+      value: ""
+    - name: REGION_LABEL_KEY
+      value: region
+    - name: SYNC_LABEL
+      value: metal-credential-sync.metal.ironcore.dev/sync
+
+  envOverrides: {}
+
+  # imagePullSecrets:
+  #   - name: myregistrykey
+
+  podSecurityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+
+  securityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+    readOnlyRootFilesystem: true
+
+  resources:
+    limits:
+      cpu: 500m
+      memory: 128Mi
+    requests:
+      cpu: 10m
+      memory: 64Mi
+
+  affinity: {}
+
+  nodeSelector: {}
+
+  tolerations: []
+
+  # strategy:
+  #   type: RollingUpdate
+  #   rollingUpdate:
+  #     maxSurge: 25%
+  #     maxUnavailable: 25%
+
+  # priorityClassName: ""
+
+  # topologySpreadConstraints: []
+
+  terminationGracePeriodSeconds: 10
+
+  # labels: {}
+
+  # annotations: {}
+
+  # pod:
+  #   labels: {}
+  #   annotations: {}
+
+rbac:
+  ## RBAC resource scope
+  ## - false (default): ClusterRole/ClusterRoleBinding (all namespaces)
+  ## - true: Role/RoleBinding (release namespace only)
+  ##
+  namespaced: false
+
+  helpers:
+    ## Install convenience admin/editor/viewer roles for CRDs
+    ##
+    enable: false
+
+serviceAccount:
+  # Install default ServiceAccount provided
+  enable: true
+
+  ## Existing ServiceAccount name (only when enable=false)
+  ## Note: When enable=true, respects nameOverride/fullnameOverride
+  ##
+  # name: ""
+
+  ## Custom ServiceAccount annotations
+  ##
+  # annotations: {}
+
+  ## Custom ServiceAccount labels
+  ##
+  # labels: {}
+
+crd:
+  enable: true
+  keep: true
+
+metrics:
+  enable: true
+  port: 8443
+  # Enable secure metrics: HTTPS with certs/auth (true) or HTTP (false).
+  # Note: Metrics authn/authz needs ClusterRole access.
+  secure: true
+
+certManager:
+  enable: false
+
+prometheus:
+  enable: false

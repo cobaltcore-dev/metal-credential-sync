@@ -1,0 +1,990 @@
+// SPDX-FileCopyrightText: 2026 SAP SE or an SAP affiliate company and CobaltCore contributors
+// SPDX-License-Identifier: Apache-2.0
+
+package controller
+
+import (
+	"context"
+	"fmt"
+	"testing"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+
+	configv1alpha1 "github.com/ironcore-dev/metal-credential-sync/api/v1alpha1"
+	"github.com/ironcore-dev/metal-credential-sync/internal/secretbackend"
+	metalv1alpha1 "github.com/ironcore-dev/metal-operator/api/v1alpha1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	"github.com/ironcore-dev/metal-credential-sync/internal/controller/mock"
+)
+
+const (
+	testBMCHostname = "bmc-server1.example.com"
+)
+
+func TestBMCSecretController(t *testing.T) {
+	RegisterFailHandler(Fail)
+	RunSpecs(t, "BMCSecret Controller Suite")
+}
+
+var _ = Describe("BMCSecret Controller", func() {
+	var (
+		ctx                context.Context
+		mockBackend        *mock.MockBackend
+		mockBackendFactory *mock.MockBackendFactory
+		reconciler         *BMCSecretReconciler
+		recorder           *record.FakeRecorder
+		scheme             *runtime.Scheme
+	)
+
+	BeforeEach(func() {
+		ctx = context.Background()
+
+		// Setup scheme
+		scheme = runtime.NewScheme()
+		Expect(metalv1alpha1.AddToScheme(scheme)).To(Succeed())
+		Expect(configv1alpha1.AddToScheme(scheme)).To(Succeed())
+
+		// Setup mock backend
+		mockBackend = mock.NewMockBackend()
+		var err error
+		mockBackendFactory, err = mock.NewMockBackendFactory(
+			mockBackend,
+			"bmc/{{.Region}}/{{.Hostname}}/{{.Username}}",
+			"region",
+			"",
+		)
+		Expect(err).NotTo(HaveOccurred())
+
+		// Create fake recorder
+		recorder = record.NewFakeRecorder(100)
+	})
+
+	Context("When reconciling a BMCSecret with BMC references", func() {
+		It("Should sync credentials to backend", func() {
+			bmcSecret := &metalv1alpha1.BMCSecret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-secret",
+				},
+				Data: map[string][]byte{
+					"username": []byte("admin"),
+					"password": []byte("secret123"),
+				},
+			}
+
+			hostname := testBMCHostname
+			bmc := &metalv1alpha1.BMC{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-bmc-1",
+					Labels: map[string]string{
+						"region": "us-east-1",
+					},
+				},
+				Spec: metalv1alpha1.BMCSpec{
+					BMCSecretRef: corev1.LocalObjectReference{
+						Name: "test-secret",
+					},
+					Hostname: &hostname,
+					Protocol: metalv1alpha1.Protocol{
+						Name: metalv1alpha1.ProtocolNameRedfish,
+					},
+				},
+			}
+
+			k8sClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(bmcSecret, bmc).
+				Build()
+
+			reconciler = &BMCSecretReconciler{
+				Client:         k8sClient,
+				Scheme:         scheme,
+				Recorder:       recorder,
+				BackendFactory: mockBackendFactory,
+			}
+
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: "test-secret"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(mockBackend.GetWriteCallCount()).To(Equal(1))
+			Expect(mockBackend.WriteSecretCalls[0].Path).To(Equal("bmc/us-east-1/bmc-server1.example.com/admin"))
+			Expect(mockBackend.WriteSecretCalls[0].Data["username"]).To(Equal("admin"))
+			Expect(mockBackend.WriteSecretCalls[0].Data["password"]).To(Equal("secret123"))
+		})
+
+		It("Should sync to multiple paths when multiple BMCs reference the same secret", func() {
+			bmcSecret := &metalv1alpha1.BMCSecret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "shared-secret",
+				},
+				Data: map[string][]byte{
+					"username": []byte("admin"),
+					"password": []byte("shared123"),
+				},
+			}
+
+			hostname1 := "bmc1.example.com"
+			bmc1 := &metalv1alpha1.BMC{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-bmc-1",
+					Labels: map[string]string{
+						"region": "us-east-1",
+					},
+				},
+				Spec: metalv1alpha1.BMCSpec{
+					BMCSecretRef: corev1.LocalObjectReference{Name: "shared-secret"},
+					Hostname:     &hostname1,
+					Protocol:     metalv1alpha1.Protocol{Name: metalv1alpha1.ProtocolNameRedfish},
+				},
+			}
+
+			hostname2 := "bmc2.example.com"
+			bmc2 := &metalv1alpha1.BMC{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-bmc-2",
+					Labels: map[string]string{
+						"region": "us-west-1",
+					},
+				},
+				Spec: metalv1alpha1.BMCSpec{
+					BMCSecretRef: corev1.LocalObjectReference{Name: "shared-secret"},
+					Hostname:     &hostname2,
+					Protocol:     metalv1alpha1.Protocol{Name: metalv1alpha1.ProtocolNameRedfish},
+				},
+			}
+
+			k8sClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(bmcSecret, bmc1, bmc2).
+				Build()
+
+			reconciler = &BMCSecretReconciler{
+				Client:         k8sClient,
+				Scheme:         scheme,
+				Recorder:       recorder,
+				BackendFactory: mockBackendFactory,
+			}
+
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: "shared-secret"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(mockBackend.GetWriteCallCount()).To(Equal(2))
+
+			paths := make([]string, len(mockBackend.WriteSecretCalls))
+			for i, call := range mockBackend.WriteSecretCalls {
+				paths[i] = call.Path
+			}
+			Expect(paths).To(ConsistOf(
+				"bmc/us-east-1/bmc1.example.com/admin",
+				"bmc/us-west-1/bmc2.example.com/admin",
+			))
+		})
+
+		It("Should skip secrets without required sync label when configured", func() {
+			mockBackendFactory.SyncLabel = "sync-enabled"
+
+			bmcSecret := &metalv1alpha1.BMCSecret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "unlabeled-secret",
+				},
+				Data: map[string][]byte{
+					"username": []byte("admin"),
+					"password": []byte("secret123"),
+				},
+			}
+
+			hostname := testBMCHostname
+			bmc := &metalv1alpha1.BMC{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-bmc",
+					Labels: map[string]string{
+						"region": "us-east-1",
+					},
+				},
+				Spec: metalv1alpha1.BMCSpec{
+					BMCSecretRef: corev1.LocalObjectReference{Name: "unlabeled-secret"},
+					Hostname:     &hostname,
+					Protocol:     metalv1alpha1.Protocol{Name: metalv1alpha1.ProtocolNameRedfish},
+				},
+			}
+
+			k8sClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(bmcSecret, bmc).
+				Build()
+
+			reconciler = &BMCSecretReconciler{
+				Client:         k8sClient,
+				Scheme:         scheme,
+				Recorder:       recorder,
+				BackendFactory: mockBackendFactory,
+			}
+
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: "unlabeled-secret"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(mockBackend.GetWriteCallCount()).To(Equal(0))
+		})
+
+		It("Should sync secrets WITH required sync label", func() {
+			mockBackendFactory.SyncLabel = "sync-enabled"
+
+			bmcSecret := &metalv1alpha1.BMCSecret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "labeled-secret",
+					Labels: map[string]string{
+						"sync-enabled": "true",
+					},
+				},
+				Data: map[string][]byte{
+					"username": []byte("admin"),
+					"password": []byte("secret123"),
+				},
+			}
+
+			hostname := testBMCHostname
+			bmc := &metalv1alpha1.BMC{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-bmc",
+					Labels: map[string]string{
+						"region": "us-east-1",
+					},
+				},
+				Spec: metalv1alpha1.BMCSpec{
+					BMCSecretRef: corev1.LocalObjectReference{Name: "labeled-secret"},
+					Hostname:     &hostname,
+					Protocol:     metalv1alpha1.Protocol{Name: metalv1alpha1.ProtocolNameRedfish},
+				},
+			}
+
+			k8sClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(bmcSecret, bmc).
+				Build()
+
+			reconciler = &BMCSecretReconciler{
+				Client:         k8sClient,
+				Scheme:         scheme,
+				Recorder:       recorder,
+				BackendFactory: mockBackendFactory,
+			}
+
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: "labeled-secret"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(mockBackend.GetWriteCallCount()).To(Equal(1))
+		})
+
+		It("Should handle missing BMC references gracefully", func() {
+			bmcSecret := &metalv1alpha1.BMCSecret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "orphan-secret",
+				},
+				Data: map[string][]byte{
+					"username": []byte("admin"),
+					"password": []byte("secret123"),
+				},
+			}
+
+			k8sClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(bmcSecret).
+				Build()
+
+			reconciler = &BMCSecretReconciler{
+				Client:         k8sClient,
+				Scheme:         scheme,
+				Recorder:       recorder,
+				BackendFactory: mockBackendFactory,
+			}
+
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: "orphan-secret"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(mockBackend.GetWriteCallCount()).To(Equal(0))
+			Eventually(recorder.Events).Should(Receive(ContainSubstring("NoBMCReference")))
+		})
+
+		It("Should handle missing credentials gracefully", func() {
+			bmcSecret := &metalv1alpha1.BMCSecret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "incomplete-secret",
+				},
+				Data: map[string][]byte{
+					"username": []byte("admin"),
+				},
+			}
+
+			hostname := testBMCHostname
+			bmc := &metalv1alpha1.BMC{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-bmc",
+					Labels: map[string]string{
+						"region": "us-east-1",
+					},
+				},
+				Spec: metalv1alpha1.BMCSpec{
+					BMCSecretRef: corev1.LocalObjectReference{Name: "incomplete-secret"},
+					Hostname:     &hostname,
+					Protocol:     metalv1alpha1.Protocol{Name: metalv1alpha1.ProtocolNameRedfish},
+				},
+			}
+
+			k8sClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(bmcSecret, bmc).
+				Build()
+
+			reconciler = &BMCSecretReconciler{
+				Client:         k8sClient,
+				Scheme:         scheme,
+				Recorder:       recorder,
+				BackendFactory: mockBackendFactory,
+			}
+
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: "incomplete-secret"},
+			})
+			Expect(err).To(HaveOccurred())
+
+			Expect(mockBackend.GetWriteCallCount()).To(Equal(0))
+			Eventually(recorder.Events).Should(Receive(ContainSubstring("MissingCredentials")))
+		})
+
+		It("Should use fallback hostname when BMC has no hostname field", func() {
+			bmcSecret := &metalv1alpha1.BMCSecret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "fallback-secret",
+				},
+				Data: map[string][]byte{
+					"username": []byte("admin"),
+					"password": []byte("secret123"),
+				},
+			}
+
+			bmc := &metalv1alpha1.BMC{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "fallback-bmc-name",
+					Labels: map[string]string{
+						"region": "us-west-2",
+					},
+				},
+				Spec: metalv1alpha1.BMCSpec{
+					BMCSecretRef: corev1.LocalObjectReference{Name: "fallback-secret"},
+					Protocol:     metalv1alpha1.Protocol{Name: metalv1alpha1.ProtocolNameRedfish},
+				},
+			}
+
+			k8sClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(bmcSecret, bmc).
+				Build()
+
+			reconciler = &BMCSecretReconciler{
+				Client:         k8sClient,
+				Scheme:         scheme,
+				Recorder:       recorder,
+				BackendFactory: mockBackendFactory,
+			}
+
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: "fallback-secret"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(mockBackend.GetWriteCallCount()).To(Equal(1))
+			Expect(mockBackend.WriteSecretCalls[0].Path).To(Equal("bmc/us-west-2/fallback-bmc-name/admin"))
+		})
+
+		It("Should use 'unknown' region when BMC has no region label", func() {
+			bmcSecret := &metalv1alpha1.BMCSecret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "no-region-secret",
+				},
+				Data: map[string][]byte{
+					"username": []byte("admin"),
+					"password": []byte("secret123"),
+				},
+			}
+
+			hostname := "bmc-no-region.example.com"
+			bmc := &metalv1alpha1.BMC{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-bmc-no-region",
+				},
+				Spec: metalv1alpha1.BMCSpec{
+					BMCSecretRef: corev1.LocalObjectReference{Name: "no-region-secret"},
+					Hostname:     &hostname,
+					Protocol:     metalv1alpha1.Protocol{Name: metalv1alpha1.ProtocolNameRedfish},
+				},
+			}
+
+			k8sClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(bmcSecret, bmc).
+				Build()
+
+			reconciler = &BMCSecretReconciler{
+				Client:         k8sClient,
+				Scheme:         scheme,
+				Recorder:       recorder,
+				BackendFactory: mockBackendFactory,
+			}
+
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: "no-region-secret"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(mockBackend.GetWriteCallCount()).To(Equal(1))
+			Expect(mockBackend.WriteSecretCalls[0].Path).To(Equal("bmc/unknown/bmc-no-region.example.com/admin"))
+		})
+
+		It("Should handle backend write errors gracefully", func() {
+			mockBackend.WriteError = fmt.Errorf("backend write failed")
+
+			bmcSecret := &metalv1alpha1.BMCSecret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "error-secret",
+				},
+				Data: map[string][]byte{
+					"username": []byte("admin"),
+					"password": []byte("secret123"),
+				},
+			}
+
+			hostname := "bmc-error.example.com"
+			bmc := &metalv1alpha1.BMC{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-bmc-error",
+					Labels: map[string]string{
+						"region": "us-east-1",
+					},
+				},
+				Spec: metalv1alpha1.BMCSpec{
+					BMCSecretRef: corev1.LocalObjectReference{Name: "error-secret"},
+					Hostname:     &hostname,
+					Protocol:     metalv1alpha1.Protocol{Name: metalv1alpha1.ProtocolNameRedfish},
+				},
+			}
+
+			k8sClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(bmcSecret, bmc).
+				Build()
+
+			reconciler = &BMCSecretReconciler{
+				Client:         k8sClient,
+				Scheme:         scheme,
+				Recorder:       recorder,
+				BackendFactory: mockBackendFactory,
+			}
+
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: "error-secret"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			Eventually(recorder.Events).Should(Receive(ContainSubstring("PartialSync")))
+		})
+
+		It("Should not update backend if password is unchanged", func() {
+			err := mockBackend.WriteSecret(ctx, "bmc/us-east-1/bmc-server1.example.com/admin", map[string]any{
+				"username": "admin",
+				"password": "secret123",
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			bmcSecret := &metalv1alpha1.BMCSecret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "unchanged-secret",
+				},
+				Data: map[string][]byte{
+					"username": []byte("admin"),
+					"password": []byte("secret123"),
+				},
+			}
+
+			hostname := testBMCHostname
+			bmc := &metalv1alpha1.BMC{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-bmc",
+					Labels: map[string]string{
+						"region": "us-east-1",
+					},
+				},
+				Spec: metalv1alpha1.BMCSpec{
+					BMCSecretRef: corev1.LocalObjectReference{Name: "unchanged-secret"},
+					Hostname:     &hostname,
+					Protocol:     metalv1alpha1.Protocol{Name: metalv1alpha1.ProtocolNameRedfish},
+				},
+			}
+
+			k8sClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(bmcSecret, bmc).
+				Build()
+
+			reconciler = &BMCSecretReconciler{
+				Client:         k8sClient,
+				Scheme:         scheme,
+				Recorder:       recorder,
+				BackendFactory: mockBackendFactory,
+			}
+
+			initialWrites := mockBackend.GetWriteCallCount()
+
+			_, err = reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: "unchanged-secret"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(mockBackend.GetWriteCallCount()).To(Equal(initialWrites))
+		})
+
+		It("Should update backend when password changes", func() {
+			err := mockBackend.WriteSecret(ctx, "bmc/us-east-1/bmc-server1.example.com/admin", map[string]any{
+				"username": "admin",
+				"password": "oldpassword",
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			bmcSecret := &metalv1alpha1.BMCSecret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "changed-secret",
+				},
+				Data: map[string][]byte{
+					"username": []byte("admin"),
+					"password": []byte("newpassword"),
+				},
+			}
+
+			hostname := testBMCHostname
+			bmc := &metalv1alpha1.BMC{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-bmc",
+					Labels: map[string]string{
+						"region": "us-east-1",
+					},
+				},
+				Spec: metalv1alpha1.BMCSpec{
+					BMCSecretRef: corev1.LocalObjectReference{Name: "changed-secret"},
+					Hostname:     &hostname,
+					Protocol:     metalv1alpha1.Protocol{Name: metalv1alpha1.ProtocolNameRedfish},
+				},
+			}
+
+			k8sClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(bmcSecret, bmc).
+				Build()
+
+			reconciler = &BMCSecretReconciler{
+				Client:         k8sClient,
+				Scheme:         scheme,
+				Recorder:       recorder,
+				BackendFactory: mockBackendFactory,
+			}
+
+			initialWrites := mockBackend.GetWriteCallCount()
+
+			_, err = reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: "changed-secret"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(mockBackend.GetWriteCallCount()).To(Equal(initialWrites + 1))
+
+			data, err := mockBackend.ReadSecret(ctx, "bmc/us-east-1/bmc-server1.example.com/admin")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(data["password"]).To(Equal("newpassword"))
+		})
+
+		It("Should handle nonexistent BMCSecret", func() {
+			k8sClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				Build()
+
+			reconciler = &BMCSecretReconciler{
+				Client:         k8sClient,
+				Scheme:         scheme,
+				Recorder:       recorder,
+				BackendFactory: mockBackendFactory,
+			}
+
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: "nonexistent-secret"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(mockBackend.GetWriteCallCount()).To(Equal(0))
+		})
+
+		It("Should create BMCSecretSyncStatus tracking successful sync", func() {
+			bmcSecret := &metalv1alpha1.BMCSecret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "tracked-secret",
+				},
+				Data: map[string][]byte{
+					"username": []byte("admin"),
+					"password": []byte("secret123"),
+				},
+			}
+
+			hostname := testBMCHostname
+			bmc := &metalv1alpha1.BMC{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-bmc",
+					Labels: map[string]string{
+						"region": "us-east-1",
+					},
+				},
+				Spec: metalv1alpha1.BMCSpec{
+					BMCSecretRef: corev1.LocalObjectReference{Name: "tracked-secret"},
+					Hostname:     &hostname,
+					Protocol:     metalv1alpha1.Protocol{Name: metalv1alpha1.ProtocolNameRedfish},
+				},
+			}
+
+			k8sClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(bmcSecret, bmc).
+				WithStatusSubresource(&configv1alpha1.BMCSecretSyncStatus{}).
+				Build()
+
+			reconciler = &BMCSecretReconciler{
+				Client:         k8sClient,
+				Scheme:         scheme,
+				Recorder:       recorder,
+				BackendFactory: mockBackendFactory,
+			}
+
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: "tracked-secret"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Verify sync status was created
+			syncStatus := &configv1alpha1.BMCSecretSyncStatus{}
+			err = k8sClient.Get(ctx, types.NamespacedName{Name: "tracked-secret-sync-status"}, syncStatus)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Verify status content
+			Expect(syncStatus.Spec.BMCSecretRef).To(Equal("tracked-secret"))
+			Expect(syncStatus.Status.TotalPaths).To(Equal(1))
+			Expect(syncStatus.Status.SuccessfulPaths).To(Equal(1))
+			Expect(syncStatus.Status.FailedPaths).To(Equal(0))
+			Expect(syncStatus.Status.BackendPaths).To(HaveLen(1))
+			Expect(syncStatus.Status.BackendPaths[0].Path).To(Equal("bmc/us-east-1/bmc-server1.example.com/admin"))
+			Expect(syncStatus.Status.BackendPaths[0].BMCName).To(Equal("test-bmc"))
+			Expect(syncStatus.Status.BackendPaths[0].SyncStatus).To(Equal("Success"))
+		})
+
+		It("Should update BMCSecretSyncStatus with failure information", func() {
+			mockBackend.WriteError = fmt.Errorf("backend connection failed")
+
+			bmcSecret := &metalv1alpha1.BMCSecret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "failed-secret",
+				},
+				Data: map[string][]byte{
+					"username": []byte("admin"),
+					"password": []byte("secret123"),
+				},
+			}
+
+			hostname := testBMCHostname
+			bmc := &metalv1alpha1.BMC{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-bmc",
+					Labels: map[string]string{
+						"region": "us-east-1",
+					},
+				},
+				Spec: metalv1alpha1.BMCSpec{
+					BMCSecretRef: corev1.LocalObjectReference{Name: "failed-secret"},
+					Hostname:     &hostname,
+					Protocol:     metalv1alpha1.Protocol{Name: metalv1alpha1.ProtocolNameRedfish},
+				},
+			}
+
+			k8sClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(bmcSecret, bmc).
+				WithStatusSubresource(&configv1alpha1.BMCSecretSyncStatus{}).
+				Build()
+
+			reconciler = &BMCSecretReconciler{
+				Client:         k8sClient,
+				Scheme:         scheme,
+				Recorder:       recorder,
+				BackendFactory: mockBackendFactory,
+			}
+
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: "failed-secret"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Verify sync status shows failure
+			syncStatus := &configv1alpha1.BMCSecretSyncStatus{}
+			err = k8sClient.Get(ctx, types.NamespacedName{Name: "failed-secret-sync-status"}, syncStatus)
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(syncStatus.Status.TotalPaths).To(Equal(1))
+			Expect(syncStatus.Status.SuccessfulPaths).To(Equal(0))
+			Expect(syncStatus.Status.FailedPaths).To(Equal(1))
+			Expect(syncStatus.Status.BackendPaths).To(HaveLen(1))
+			Expect(syncStatus.Status.BackendPaths[0].SyncStatus).To(Equal("Failed"))
+			Expect(syncStatus.Status.BackendPaths[0].ErrorMessage).To(ContainSubstring("backend connection failed"))
+		})
+	})
+})
+
+var _ = Describe("BMCSecret Multi-Engine Controller", func() {
+	var ctx context.Context
+
+	BeforeEach(func() {
+		ctx = context.Background()
+	})
+
+	Context("Single engine label match", func() {
+		It("Should match engine with exact label value", func() {
+			engines := []configv1alpha1.SecretEngineConfig{
+				{
+					Name:         "team-a",
+					MountPath:    "secret",
+					PathTemplate: "bmc/team-a/{{.Region}}/{{.Hostname}}/{{.Username}}",
+					SyncLabel:    "team=a",
+				},
+			}
+			multiEngineFactory, err := mock.NewMultiEngineBackendFactory(engines, "", "region")
+			Expect(err).NotTo(HaveOccurred())
+
+			labels := map[string]string{"team": "a"}
+			matchingEngines, err := multiEngineFactory.GetMatchingEngines(ctx, labels)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(matchingEngines).To(HaveLen(1))
+			Expect(matchingEngines[0].Name).To(Equal("team-a"))
+		})
+	})
+
+	Context("Multiple engine label matches", func() {
+		It("Should match all matching engines", func() {
+			engines := []configv1alpha1.SecretEngineConfig{
+				{
+					Name:      "team-a",
+					MountPath: "team-a-secret",
+					SyncLabel: "team=a",
+				},
+				{
+					Name:      "critical-prod",
+					MountPath: "critical-secret",
+					SyncLabel: "critical=true",
+				},
+			}
+			multiEngineFactory, err := mock.NewMultiEngineBackendFactory(engines, "", "region")
+			Expect(err).NotTo(HaveOccurred())
+
+			labels := map[string]string{"team": "a", "critical": "true"}
+			matchingEngines, err := multiEngineFactory.GetMatchingEngines(ctx, labels)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(matchingEngines).To(HaveLen(2))
+		})
+	})
+
+	Context("Label matching - exact vs any value", func() {
+		It("Should match exact label values (key=value)", func() {
+			engines := []configv1alpha1.SecretEngineConfig{
+				{
+					Name:      "exact-match",
+					MountPath: "secret",
+					SyncLabel: "env=prod",
+				},
+			}
+			multiEngineFactory, err := mock.NewMultiEngineBackendFactory(engines, "", "region")
+			Expect(err).NotTo(HaveOccurred())
+
+			labels1 := map[string]string{"env": "prod"}
+			matching, err := multiEngineFactory.GetMatchingEngines(ctx, labels1)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(matching).To(HaveLen(1))
+
+			labels2 := map[string]string{"env": "dev"}
+			matching, err = multiEngineFactory.GetMatchingEngines(ctx, labels2)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(matching).To(BeEmpty())
+		})
+
+		It("Should match any value for key-only labels", func() {
+			engines := []configv1alpha1.SecretEngineConfig{
+				{
+					Name:      "any-value-match",
+					MountPath: "secret",
+					SyncLabel: "sync-enabled",
+				},
+			}
+			multiEngineFactory, err := mock.NewMultiEngineBackendFactory(engines, "", "region")
+			Expect(err).NotTo(HaveOccurred())
+
+			labels1 := map[string]string{"sync-enabled": "true"}
+			matching, err := multiEngineFactory.GetMatchingEngines(ctx, labels1)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(matching).To(HaveLen(1))
+
+			labels2 := map[string]string{"sync-enabled": "yes"}
+			matching, err = multiEngineFactory.GetMatchingEngines(ctx, labels2)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(matching).To(HaveLen(1))
+
+			labels3 := map[string]string{"other-label": "value"}
+			matching, err = multiEngineFactory.GetMatchingEngines(ctx, labels3)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(matching).To(BeEmpty())
+		})
+	})
+
+	Context("Global syncLabel filtering", func() {
+		It("Should require global syncLabel when configured", func() {
+			engines := []configv1alpha1.SecretEngineConfig{
+				{
+					Name:      "team-a",
+					MountPath: "secret",
+					SyncLabel: "team=a",
+				},
+			}
+			multiEngineFactory, err := mock.NewMultiEngineBackendFactory(engines, "globally-sync", "region")
+			Expect(err).NotTo(HaveOccurred())
+
+			labels := map[string]string{"team": "a", "globally-sync": "true"}
+			matching, err := multiEngineFactory.GetMatchingEngines(ctx, labels)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(matching).To(HaveLen(1))
+
+			labels2 := map[string]string{"team": "a"}
+			matching, err = multiEngineFactory.GetMatchingEngines(ctx, labels2)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(matching).To(BeEmpty())
+		})
+	})
+
+	Context("Path templates per engine", func() {
+		It("Should apply different path templates for each engine", func() {
+			engines := []configv1alpha1.SecretEngineConfig{
+				{
+					Name:         "team-a",
+					MountPath:    "secret-a",
+					PathTemplate: "team-a/{{.Region}}/{{.Hostname}}/{{.Username}}",
+					SyncLabel:    "team=a",
+				},
+				{
+					Name:         "team-b",
+					MountPath:    "secret-b",
+					PathTemplate: "prod/{{.Region}}/bmc/{{.Hostname}}/user-{{.Username}}",
+					SyncLabel:    "team=b",
+				},
+			}
+			multiEngineFactory, err := mock.NewMultiEngineBackendFactory(engines, "", "region")
+			Expect(err).NotTo(HaveOccurred())
+
+			builderA, err := multiEngineFactory.GetPathBuilderForEngine(ctx, "team-a")
+			Expect(err).NotTo(HaveOccurred())
+
+			pathA, err := builderA.Build(secretbackend.PathVariables{
+				Region:   "us-east-1",
+				Hostname: "server1.com",
+				Username: "admin",
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(pathA).To(Equal("team-a/us-east-1/server1.com/admin"))
+		})
+	})
+
+	Context("Mount paths per engine", func() {
+		It("Should track different mount paths for each engine", func() {
+			engines := []configv1alpha1.SecretEngineConfig{
+				{
+					Name:      "team-a",
+					MountPath: "kv-team-a",
+					SyncLabel: "team=a",
+				},
+				{
+					Name:      "team-b",
+					MountPath: "kv-team-b",
+					SyncLabel: "team=b",
+				},
+			}
+			multiEngineFactory, err := mock.NewMultiEngineBackendFactory(engines, "", "region")
+			Expect(err).NotTo(HaveOccurred())
+
+			allEngines, err := multiEngineFactory.GetSecretEngines(ctx)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(allEngines).To(HaveLen(2))
+		})
+	})
+
+	Context("Error isolation between engines", func() {
+		It("Should continue syncing if one engine fails", func() {
+			engines := []configv1alpha1.SecretEngineConfig{
+				{
+					Name:      "backend-1",
+					MountPath: "secret",
+					SyncLabel: "env=prod",
+				},
+				{
+					Name:      "backend-2",
+					MountPath: "secret",
+					SyncLabel: "env=prod",
+				},
+			}
+			multiEngineFactory, err := mock.NewMultiEngineBackendFactory(engines, "", "region")
+			Expect(err).NotTo(HaveOccurred())
+
+			backendMock1 := multiEngineFactory.GetMockBackendForEngine("backend-1")
+			backendMock1.WriteError = fmt.Errorf("connection error")
+
+			labels := map[string]string{"env": "prod"}
+			matchingEngines, err := multiEngineFactory.GetMatchingEngines(ctx, labels)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(matchingEngines).To(HaveLen(2))
+
+			backendMock2 := multiEngineFactory.GetMockBackendForEngine("backend-2")
+			err = backendMock2.WriteSecret(ctx, "backend2/us-east-1/bmc-server/admin", map[string]any{
+				"username": "admin",
+				"password": "secret123",
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(backendMock2.GetWriteCallCount()).To(Equal(1))
+		})
+	})
+
+	Context("Backward compatibility", func() {
+		It("Should work with no engines configured", func() {
+			engines := []configv1alpha1.SecretEngineConfig{}
+			multiEngineFactory, err := mock.NewMultiEngineBackendFactory(engines, "", "region")
+			Expect(err).NotTo(HaveOccurred())
+
+			labels := map[string]string{"any": "label"}
+			matchingEngines, err := multiEngineFactory.GetMatchingEngines(ctx, labels)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(matchingEngines).To(BeEmpty())
+		})
+	})
+})

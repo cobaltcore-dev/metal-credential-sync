@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: 2024 SAP SE or an SAP affiliate company and IronCore contributors
+# SPDX-License-Identifier: Apache-2.0
+
+name: PR Size Labeling
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  size-label:
+    name: Label PR by size
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Apply size label
+        uses: codelytv/pr-size-labeler@v1
+        with:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          xs_label: 'size/xs'
+          xs_max_size: 10
+          s_label: 'size/s'
+          s_max_size: 50
+          m_label: 'size/m'
+          m_max_size: 200
+          l_label: 'size/l'
+          l_max_size: 500
+          xl_label: 'size/xl'
+          fail_if_xl: false

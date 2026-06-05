@@ -1,0 +1,46 @@
+# SPDX-FileCopyrightText: 2024 SAP SE or an SAP affiliate company and IronCore contributors
+# SPDX-License-Identifier: Apache-2.0
+
+name: E2E Tests
+
+on:
+  pull_request:
+    types: [assigned, opened, synchronize, reopened]
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+
+jobs:
+  test-e2e:
+    name: Run E2E tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install Kind
+        run: |
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/latest/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+
+      - name: Verify Kind installation
+        run: kind version
+
+      - name: Create Kind cluster
+        run: kind create cluster --name metal-credential-sync-test-e2e
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Run E2E tests
+        run: make test-e2e
+        env:
+          KIND_CLUSTER: metal-credential-sync-test-e2e

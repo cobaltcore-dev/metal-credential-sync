@@ -1,0 +1,44 @@
+# SPDX-FileCopyrightText: 2024 SAP SE or an SAP affiliate company and IronCore contributors
+# SPDX-License-Identifier: Apache-2.0
+
+name: Check Code Generation
+
+on:
+  pull_request:
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+
+jobs:
+  check-codegen:
+    name: Verify generated code
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run code generation
+        run: |
+          make manifests
+          make generate
+
+      - name: Check for uncommitted changes
+        run: |
+          if [ "$(git diff | wc -l)" -gt "0" ]; then
+            echo "❌ Detected uncommitted changes after code generation"
+            echo "Run 'make manifests && make generate' and commit the changes"
+            echo ""
+            echo "Changed files:"
+            git diff --name-only
+            echo ""
+            echo "Diff:"
+            git diff
+            exit 1
+          fi
+          echo "✅ Generated code is up-to-date"

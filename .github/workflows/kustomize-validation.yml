@@ -1,0 +1,34 @@
+# SPDX-FileCopyrightText: 2024 SAP SE or an SAP affiliate company and IronCore contributors
+# SPDX-License-Identifier: Apache-2.0
+
+name: Kustomize Validation
+
+on:
+  pull_request:
+    paths:
+      - 'config/**'
+
+jobs:
+  validate-kustomize:
+    name: Validate Kustomize manifests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@v6
+
+      - name: Install Kustomize
+        run: |
+          curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+          sudo mv kustomize /usr/local/bin
+
+      - name: Validate default overlay
+        run: kustomize build config/default
+
+      - name: Validate CRD overlay
+        run: kustomize build config/crd
+
+      - name: Validate manager overlay
+        run: kustomize build config/manager
+
+      - name: Validate RBAC overlay
+        run: kustomize build config/rbac

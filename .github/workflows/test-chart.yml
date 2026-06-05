@@ -1,0 +1,117 @@
+# SPDX-FileCopyrightText: 2026 SAP SE or an SAP affiliate company and CobaltCore contributors
+# SPDX-License-Identifier: Apache-2.0
+
+name: Test Chart
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+
+jobs:
+  test-chart:
+    name: Run Helm chart tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install Helm
+        uses: azure/setup-helm@v5
+        with:
+          version: v3.16.2
+
+      - name: Verify Helm installation
+        run: helm version
+
+      - name: Build Helm chart dependencies
+        run: helm dependency build ./dist/chart
+
+      - name: Lint Helm Chart
+        run: helm lint ./dist/chart
+
+      - name: Template Helm Chart
+        run: |
+          helm template test-release ./dist/chart \
+            --namespace metal-credential-sync-system \
+            --create-namespace \
+            --debug
+
+      - name: Install Kind
+        run: |
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/latest/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+
+      - name: Create Kind cluster
+        run: kind create cluster
+
+      - name: Build and load Docker image
+        run: |
+          make docker-build IMG=metal-credential-sync:ci-test
+          kind load docker-image metal-credential-sync:ci-test
+
+      - name: Install cert-manager
+        run: |
+          helm repo add jetstack https://charts.jetstack.io
+          helm repo update
+          helm install cert-manager jetstack/cert-manager \
+            --namespace cert-manager \
+            --create-namespace \
+            --set crds.enabled=true \
+            --wait \
+            --timeout=5m
+
+      - name: Wait for cert-manager to be ready
+        run: |
+          kubectl wait --namespace cert-manager \
+            --for=condition=available \
+            --timeout=300s \
+            deployment/cert-manager
+          kubectl wait --namespace cert-manager \
+            --for=condition=available \
+            --timeout=300s \
+            deployment/cert-manager-cainjector
+          kubectl wait --namespace cert-manager \
+            --for=condition=available \
+            --timeout=300s \
+            deployment/cert-manager-webhook
+
+      - name: Install metal-operator CRDs
+        run: |
+          METAL_OPERATOR_VERSION=$(grep 'github.com/ironcore-dev/metal-operator' go.mod | awk '{print $2}')
+          BASE_URL="https://raw.githubusercontent.com/ironcore-dev/metal-operator/${METAL_OPERATOR_VERSION}/config/crd/bases"
+          kubectl apply -f "${BASE_URL}/metal.ironcore.dev_bmcsecrets.yaml"
+          kubectl apply -f "${BASE_URL}/metal.ironcore.dev_bmcs.yaml"
+
+      - name: Install Helm chart
+        run: |
+          helm install test-release ./dist/chart \
+            --namespace metal-credential-sync-system \
+            --create-namespace \
+            --set manager.image.repository=metal-credential-sync \
+            --set manager.image.tag=ci-test \
+            --wait \
+            --timeout=5m
+
+      - name: Check Helm release status
+        run: |
+          helm status test-release --namespace metal-credential-sync-system
+
+      - name: Verify controller pod is running
+        run: |
+          kubectl wait --namespace metal-credential-sync-system \
+            --for=condition=ready \
+            --timeout=300s \
+            pod -l control-plane=controller-manager
