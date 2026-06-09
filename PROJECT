@@ -11,7 +11,7 @@ plugins:
     manifests: dist/install.yaml
     output: dist
 projectName: metal-credential-sync
-repo: github.com/ironcore-dev/metal-credential-sync
+repo: github.com/cobaltcore-dev/metal-credential-sync
 resources:
 - api:
     crdVersion: v1

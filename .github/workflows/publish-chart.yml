@@ -87,8 +87,8 @@ jobs:
       - name: Set container image tag
         run: |
           IMAGE_TAG=sha-$(echo ${{ github.sha }} | cut -c1-7)
-          yq -i '.controllerManager.manager.image.repository = "ghcr.io/cobaltcore-dev/metal-credential-sync"' dist/chart/values.yaml
-          yq -i '.controllerManager.manager.image.tag = "'$IMAGE_TAG'"' dist/chart/values.yaml
+          yq -i '.manager.image.repository = "ghcr.io/cobaltcore-dev/metal-credential-sync"' dist/chart/values.yaml
+          yq -i '.manager.image.tag = "'$IMAGE_TAG'"' dist/chart/values.yaml
 
       - name: Login to GitHub Container Registry
         run: |

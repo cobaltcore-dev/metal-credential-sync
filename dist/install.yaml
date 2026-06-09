@@ -611,7 +611,7 @@ spec:
           value: region
         - name: SYNC_LABEL
           value: metal-credential-sync.metal.ironcore.dev/sync
-        image: ghcr.io/ironcore-dev/metal-credential-sync:latest
+        image: ghcr.io/cobaltcore-dev/metal-credential-sync:latest
         livenessProbe:
           httpGet:
             path: /healthz

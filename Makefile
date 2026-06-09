@@ -1,5 +1,5 @@
 # Image URL to use all building/pushing image targets
-IMG ?= ghcr.io/ironcore-dev/metal-credential-sync:latest
+IMG ?= ghcr.io/cobaltcore-dev/metal-credential-sync:latest
 
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
